@@ -42,7 +42,7 @@ def patch_app_name(work_dir: Path, res_dir: Path, app_name: str) -> bool:
 
     results = [
         patch_xml_string(res_dir, tag, lambda _: escaped_xml_name)
-        for tag in ("NagramX", "AppName", "Nagram")
+        for tag in ("NagramX", "AppName", "Nagram", "NekoX")
     ]
     # _strip_nagram_branding keys off Latin "Nagram X" and Arabic "ناگرام";
     # localized transliterations (e.g. "Нагрхам") pass through unchanged -
