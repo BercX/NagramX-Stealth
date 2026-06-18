@@ -15,6 +15,10 @@ permissions:
   id-token: write
   attestations: write
 
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
 env:
   UPSTREAM_REPO: "risin42/NagramX"
   APP_NAME: "Telegram"
@@ -22,6 +26,7 @@ env:
 jobs:
   resolve:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     outputs:
       skip: ${{ steps.check.outputs.skip }}
       tag: ${{ steps.resolve.outputs.tag }}
@@ -37,18 +42,19 @@ jobs:
           if [ -n "$INPUT_TAG" ]; then
             TAG="$INPUT_TAG"
           else
-            TAG=$(gh api repos/${{ env.UPSTREAM_REPO }}/releases/latest --jq '.tag_name')
+            TAG=$(gh release list --repo "$UPSTREAM_REPO" --json tagName,isLatest \
+              --jq '.[] | select(.isLatest) | .tagName')
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "🏷️ Target release: $TAG"
 
-          RELEASE=$(gh api "repos/${{ env.UPSTREAM_REPO }}/releases/tags/$TAG" --jq '{name: (.name // ""), body: (.body // "")}')
+          RELEASE=$(gh release view "$TAG" --repo "$UPSTREAM_REPO" --json name,body)
           {
             echo 'upstream_name<<NAME_EOF'
-            echo "$RELEASE" | jq -r '.name'
+            echo "$RELEASE" | jq -r '.name // ""'
             echo 'NAME_EOF'
             echo 'upstream_body<<BODY_EOF'
-            echo "$RELEASE" | jq -r '.body'
+            echo "$RELEASE" | jq -r '.body // ""'
             echo 'BODY_EOF'
           } >> "$GITHUB_OUTPUT"
 
@@ -68,6 +74,7 @@ jobs:
     needs: resolve
     if: needs.resolve.outputs.skip != 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
       - name: Checkout this repo
@@ -79,76 +86,17 @@ jobs:
           TAG: ${{ needs.resolve.outputs.tag }}
         run: |
           echo "📥 Downloading APKs from ${{ env.UPSTREAM_REPO }} @ $TAG"
-          gh release download "$TAG" --repo "${{ env.UPSTREAM_REPO }}" --pattern '*.apk'
+          mkdir -p input
+          gh release download "$TAG" --repo "${{ env.UPSTREAM_REPO }}" --pattern '*.apk' --dir input
 
-      - name: Setup Java 25
-        uses: actions/setup-java@v5
-        with:
-          distribution: temurin
-          java-version: 25
-
-      - name: Install apktool & uber-apk-signer
-        run: |
-          APKTOOL_VER="3.0.2"
-          curl -fSL -o apktool.jar \
-            "https://github.com/iBotPeaches/Apktool/releases/download/v${APKTOOL_VER}/apktool_${APKTOOL_VER}.jar"
-
-          SIGNER_VER="1.3.0"
-          curl -fSL -o uber-apk-signer.jar \
-            "https://github.com/patrickfav/uber-apk-signer/releases/download/v${SIGNER_VER}/uber-apk-signer-${SIGNER_VER}.jar"
-
-      - name: Decompile, patch, recompile
-        run: |
-          mkdir -p output /tmp/diffs
-          for apk in *.apk; do
-            echo "🔧 Processing: $apk"
-
-            java -jar apktool.jar d "$apk" -o work -f
-            cp -r work work-orig
-            python3 scripts/patch_apk.py work "${{ env.APP_NAME }}"
-            diff -ru work-orig work > "/tmp/diffs/${apk}.diff" || true
-            java -jar apktool.jar b work -o "output/${apk%.apk}-stealth.apk"
-            rm -rf work work-orig
-          done
-
-      - name: Sign APKs
+      - name: Compose release notes
+        id: notes
         env:
-          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
-          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
-        run: |
-          echo "$KEYSTORE_BASE64" | base64 -d > release.keystore
-
-          java -jar uber-apk-signer.jar \
-            --apks output/ \
-            --ks release.keystore \
-            --ksAlias release \
-            --ksPass "$KEYSTORE_PASSWORD" \
-            --ksKeyPass "$KEYSTORE_PASSWORD" \
-            --overwrite
-
-          rm -f release.keystore
-
-      - name: Attest build provenance
-        continue-on-error: true
-        uses: actions/attest-build-provenance@v4
-        with:
-          subject-path: "output/*.apk"
-
-      - name: Create release
-        id: release
-        env:
-          GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.resolve.outputs.tag }}
           UPSTREAM_NAME: ${{ needs.resolve.outputs.upstream_name }}
           UPSTREAM_BODY: ${{ needs.resolve.outputs.upstream_body }}
         run: |
-
-          RELEASE_TAG="$TAG"
-          if gh release view "$TAG" &>/dev/null; then
-            RELEASE_TAG="${TAG}-$(date +%Y%m%d%H%M%S)"
-            echo "⚠️ Tag $TAG is taken, using $RELEASE_TAG"
-          fi
-
+          set -euo pipefail
           {
             echo "- Build: [Action run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"
             echo "- Upstream: [${UPSTREAM_NAME:-$TAG}](https://github.com/${{ env.UPSTREAM_REPO }}/releases/tag/$TAG)"
@@ -156,40 +104,17 @@ jobs:
               printf '\n---\n\n## Upstream release notes\n\n%s\n' "$UPSTREAM_BODY"
             fi
           } > /tmp/release-notes.md
+          echo "title=${UPSTREAM_NAME:-$TAG}" >> "$GITHUB_OUTPUT"
 
-          gh release create "$RELEASE_TAG" \
-            --title "${UPSTREAM_NAME:-$TAG}" \
-            --notes-file /tmp/release-notes.md \
-            output/*.apk
-
-          echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
-          echo "🚀 Release created: $RELEASE_TAG"
-
-      - name: Job summary
-        env:
-          RELEASE_TAG: ${{ steps.release.outputs.release_tag }}
-          TAG: ${{ needs.resolve.outputs.tag }}
-        run: |
-          {
-            echo "### Build complete"
-            echo "**Release:** [$RELEASE_TAG](${{ github.server_url }}/${{ github.repository }}/releases/tag/$RELEASE_TAG)"
-            echo ""
-            echo "### SHA-256 checksums"
-            echo '```'
-            (cd output && sha256sum *.apk)
-            echo '```'
-            echo ""
-            echo "### Patch diff"
-            for diff_file in /tmp/diffs/*.diff; do
-              apk_name=$(basename "$diff_file" .diff)
-              echo "#### ${apk_name}"
-              echo "<details>"
-              echo "<summary>Show diff</summary>"
-              echo ""
-              echo '```diff'
-              cat "$diff_file"
-              echo '```'
-              echo "</details>"
-              echo ""
-            done
-          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Patch, sign & publish release
+        uses: ./.github/actions/patch-and-release
+        with:
+          apk-dir: input
+          app-name: ${{ env.APP_NAME }}
+          tag: ${{ needs.resolve.outputs.tag }}
+          title: ${{ steps.notes.outputs.title }}
+          notes-file: /tmp/release-notes.md
+          prerelease: "false"
+          keystore-base64: ${{ secrets.KEYSTORE_BASE64 }}
+          keystore-password: ${{ secrets.KEYSTORE_PASSWORD }}
+          github-token: ${{ github.token }}

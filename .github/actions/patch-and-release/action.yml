@@ -1,0 +1,184 @@
+name: "Patch & release NagramX APKs"
+description: >
+  Shared logic for both the release and staging pipelines: takes a directory of
+  upstream APKs, decompiles → patches (scripts/patch_apk.py) → recompiles →
+  signs them, attests provenance, and publishes a GitHub release. Differs from
+  caller to caller only by inputs (tag, title, notes, prerelease).
+
+inputs:
+  apk-dir:
+    description: "Directory holding the upstream APK(s) to patch."
+    required: false
+    default: "input"
+  app-name:
+    description: "App display name passed to scripts/patch_apk.py."
+    required: false
+    default: "Telegram"
+  tag:
+    description: "Release tag to create."
+    required: true
+  title:
+    description: "Release title."
+    required: true
+  notes-file:
+    description: "Path to a file with the release body (markdown)."
+    required: true
+  prerelease:
+    description: 'Publish as a GitHub pre-release ("true"/"false").'
+    required: false
+    default: "false"
+  keystore-base64:
+    description: "Base64-encoded signing keystore."
+    required: true
+  keystore-password:
+    description: "Keystore + key password."
+    required: true
+  github-token:
+    description: "Token with contents:write on the target repo, used to create the release."
+    required: true
+
+outputs:
+  release-tag:
+    description: "The tag actually used for the release (may differ from input on collision)."
+    value: ${{ steps.release.outputs.release_tag }}
+
+runs:
+  using: composite
+  steps:
+    - name: Setup Java 25
+      uses: actions/setup-java@v5
+      with:
+        distribution: temurin
+        java-version: 25
+
+    - name: Install apktool & uber-apk-signer
+      shell: bash
+      run: |
+        set -euo pipefail
+        APKTOOL_VER="3.0.2"
+        curl -fSL -o apktool.jar \
+          "https://github.com/iBotPeaches/Apktool/releases/download/v${APKTOOL_VER}/apktool_${APKTOOL_VER}.jar"
+
+        SIGNER_VER="1.3.0"
+        curl -fSL -o uber-apk-signer.jar \
+          "https://github.com/patrickfav/uber-apk-signer/releases/download/v${SIGNER_VER}/uber-apk-signer-${SIGNER_VER}.jar"
+
+    - name: Decompile, patch, recompile
+      shell: bash
+      env:
+        APK_DIR: ${{ inputs.apk-dir }}
+        APP_NAME: ${{ inputs.app-name }}
+      run: |
+        set -euo pipefail
+        mkdir -p output /tmp/diffs
+        shopt -s nullglob
+        apks=("$APK_DIR"/*.apk)
+        if [ ${#apks[@]} -eq 0 ]; then
+          echo "::error::No APK found in '$APK_DIR'"
+          exit 1
+        fi
+        for apk in "${apks[@]}"; do
+          base=$(basename "$apk")
+          echo "🔧 Processing: $base"
+
+          # GitHub turns "(1253)" in a release asset name into ".1253."; pre-clean the parens
+          stem=$(sed -E 's/\(([^)]*)\)/-\1/g' <<<"${base%.apk}")
+
+          java -jar apktool.jar d "$apk" -o work -f
+          cp -r work work-orig
+          python3 scripts/patch_apk.py work "$APP_NAME"
+          diff -ru work-orig work > "/tmp/diffs/${base}.diff" || true
+          java -jar apktool.jar b work -o "output/${stem}-stealth.apk"
+          rm -rf work work-orig
+        done
+
+    - name: Sign APKs
+      shell: bash
+      env:
+        KEYSTORE_BASE64: ${{ inputs.keystore-base64 }}
+        KEYSTORE_PASSWORD: ${{ inputs.keystore-password }}
+      run: |
+        set -euo pipefail
+        echo "$KEYSTORE_BASE64" | base64 -d > release.keystore
+
+        java -jar uber-apk-signer.jar \
+          --apks output/ \
+          --ks release.keystore \
+          --ksAlias release \
+          --ksPass "$KEYSTORE_PASSWORD" \
+          --ksKeyPass "$KEYSTORE_PASSWORD" \
+          --overwrite
+
+        rm -f release.keystore
+
+    - name: Attest build provenance
+      continue-on-error: true
+      uses: actions/attest-build-provenance@v4
+      with:
+        subject-path: "output/*.apk"
+
+    - name: Create release
+      id: release
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        TAG: ${{ inputs.tag }}
+        TITLE: ${{ inputs.title }}
+        NOTES_FILE: ${{ inputs.notes-file }}
+        PRERELEASE: ${{ inputs.prerelease }}
+        REPO: ${{ github.repository }}
+      run: |
+        set -euo pipefail
+
+        RELEASE_TAG="$TAG"
+        if gh release view "$TAG" --repo "$REPO" &>/dev/null; then
+          RELEASE_TAG="${TAG}-$(date +%Y%m%d%H%M%S)"
+          echo "⚠️ Tag $TAG is taken, using $RELEASE_TAG"
+        fi
+
+        PRERELEASE_FLAG=""
+        if [ "$PRERELEASE" = "true" ]; then
+          PRERELEASE_FLAG="--prerelease"
+        fi
+
+        gh release create "$RELEASE_TAG" \
+          --repo "$REPO" \
+          --title "$TITLE" \
+          --notes-file "$NOTES_FILE" \
+          $PRERELEASE_FLAG \
+          output/*.apk
+
+        echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+        echo "🚀 Release created: $RELEASE_TAG"
+
+    - name: Job summary
+      shell: bash
+      env:
+        RELEASE_TAG: ${{ steps.release.outputs.release_tag }}
+        SERVER_URL: ${{ github.server_url }}
+        REPO: ${{ github.repository }}
+      run: |
+        set -euo pipefail
+        {
+          echo "### Build complete"
+          echo "**Release:** [$RELEASE_TAG]($SERVER_URL/$REPO/releases/tag/$RELEASE_TAG)"
+          echo ""
+          echo "### SHA-256 checksums"
+          echo '```'
+          (cd output && sha256sum ./*.apk)
+          echo '```'
+          echo ""
+          echo "### Patch diff"
+          for diff_file in /tmp/diffs/*.diff; do
+            apk_name=$(basename "$diff_file" .diff)
+            echo "#### ${apk_name}"
+            echo "<details>"
+            echo "<summary>Show diff</summary>"
+            echo ""
+            echo '```diff'
+            cat "$diff_file"
+            echo '```'
+            echo "</details>"
+            echo ""
+          done
+        } >> "$GITHUB_STEP_SUMMARY"

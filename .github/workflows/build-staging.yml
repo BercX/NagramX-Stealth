@@ -1,0 +1,197 @@
+name: Build NagramX-Stealth (staging/test)
+
+# Patches the author's *test* builds and publishes them as GitHub Pre-releases.
+#
+# Staging builds never reach GitHub Releases — they exist only as a CI artifact
+# (plus a Telegram post). We pull straight from the upstream Actions artifact: it
+# ships the untouched APK + output-metadata.json (exact versionName/versionCode)
+# and can be filtered deterministically. We take the most-recent run matching:
+# workflow=staging.yml, branch=dev, conclusion=success, artifact="Staging" (live).
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "Force a specific upstream staging run id (empty = latest dev run)"
+        required: false
+        default: ""
+  schedule:
+    - cron: "40 5 * * *"
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: "risin42/NagramX"
+  UPSTREAM_WORKFLOW: "staging.yml"
+  UPSTREAM_BRANCH: "dev"
+  ARTIFACT_NAME: "Staging"
+  APP_NAME: "Telegram"
+  GH_TOKEN: ${{ secrets.UPSTREAM_TOKEN || github.token }}
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      skip: ${{ steps.check.outputs.skip }}
+      run_id: ${{ steps.resolve.outputs.run_id }}
+      short_sha: ${{ steps.resolve.outputs.short_sha }}
+      commit_url: ${{ steps.resolve.outputs.commit_url }}
+      run_url: ${{ steps.resolve.outputs.run_url }}
+      commit_message: ${{ steps.resolve.outputs.commit_message }}
+    steps:
+      - name: Resolve upstream staging run
+        id: resolve
+        env:
+          INPUT_RUN_ID: ${{ github.event.inputs.run_id }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "$INPUT_RUN_ID" ]; then
+            CANDIDATES="$INPUT_RUN_ID"
+          else
+            CANDIDATES=$(gh run list --repo "$UPSTREAM_REPO" \
+              --workflow "$UPSTREAM_WORKFLOW" --branch "$UPSTREAM_BRANCH" \
+              --status success --limit 20 --json databaseId --jq '.[].databaseId')
+          fi
+
+          RUN_ID=""
+          for id in $CANDIDATES; do
+            if gh api "repos/$UPSTREAM_REPO/actions/runs/$id/artifacts" \
+                 --jq ".artifacts[] | select(.name==\"$ARTIFACT_NAME\" and .expired==false) | .id" \
+                 | grep -q .; then
+              RUN_ID="$id"
+              break
+            fi
+          done
+
+          if [ -z "$RUN_ID" ]; then
+            echo "::error::No successful '$UPSTREAM_WORKFLOW' run on '$UPSTREAM_BRANCH' with a live '$ARTIFACT_NAME' artifact."
+            exit 1
+          fi
+
+          RUN_JSON=$(gh api "repos/$UPSTREAM_REPO/actions/runs/$RUN_ID")
+          HEAD_SHA=$(echo "$RUN_JSON" | jq -r '.head_sha')
+          SHORT_SHA="${HEAD_SHA:0:7}"
+          COMMIT_MSG=$(echo "$RUN_JSON" | jq -r '.head_commit.message // ""')
+
+          {
+            echo "run_id=$RUN_ID"
+            echo "short_sha=$SHORT_SHA"
+            echo "commit_url=https://github.com/$UPSTREAM_REPO/commit/$HEAD_SHA"
+            echo "run_url=https://github.com/$UPSTREAM_REPO/actions/runs/$RUN_ID"
+            echo 'commit_message<<COMMIT_EOF'
+            echo "$COMMIT_MSG"
+            echo 'COMMIT_EOF'
+          } >> "$GITHUB_OUTPUT"
+
+          echo "🏷️ Upstream run: $RUN_ID ($SHORT_SHA)"
+
+      - name: Check existing release
+        id: check
+        if: github.event_name != 'workflow_dispatch'
+        env:
+          SHORT_SHA: ${{ steps.resolve.outputs.short_sha }}
+        run: |
+          set -euo pipefail
+          # The tag ends with "-<short_sha>", so a cheap tag scan tells us whether
+          # this commit was already published — no artifact download on cron no-ops.
+          if gh release list --repo "${{ github.repository }}" --limit 100 \
+               --json tagName --jq '.[].tagName' | grep -qE -- "-${SHORT_SHA}([-]|\$)"; then
+            echo "⏭️ Commit $SHORT_SHA already released, skipping."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: resolve
+    if: needs.resolve.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v6
+
+      - name: Download upstream staging artifact
+        env:
+          RUN_ID: ${{ needs.resolve.outputs.run_id }}
+        run: |
+          set -euo pipefail
+          echo "📥 Downloading '$ARTIFACT_NAME' from $UPSTREAM_REPO run $RUN_ID"
+          gh run download "$RUN_ID" --repo "$UPSTREAM_REPO" --name "$ARTIFACT_NAME" --dir upstream
+          ls -R upstream
+
+      - name: Parse build metadata
+        id: meta
+        run: |
+          set -euo pipefail
+          # Compose from the two clean JSON fields (not the messy outputFile name).
+          # versionName carries the commit hash for staging ("12.7.3-edc0fe2") and
+          # nothing for stable ("12.7.3"); the hash is what makes it a pre-release.
+          META=$(find upstream -name output-metadata.json | head -n1)
+          VERSION_NAME=$(jq -r '.elements[0].versionName' "$META")  # 12.7.3-edc0fe2
+          VERSION_CODE=$(jq -r '.elements[0].versionCode' "$META")  # 1251
+
+          BASE_VERSION="${VERSION_NAME%%-*}"                        # 12.7.3
+          if [ "$VERSION_NAME" = "$BASE_VERSION" ]; then
+            # No commit hash -> stable build (same format as build.yml releases).
+            TAG="$VERSION_CODE"                                     # 1250
+            TITLE="${BASE_VERSION}.${VERSION_CODE}"                 # 12.7.3.1250
+            PRERELEASE="false"
+          else
+            HASH="${VERSION_NAME#*-}"                               # edc0fe2
+            TAG="${VERSION_CODE}-${HASH}"                           # 1251-edc0fe2
+            TITLE="${BASE_VERSION}.${VERSION_CODE}-${HASH}"         # 12.7.3.1251-edc0fe2
+            PRERELEASE="true"
+          fi
+
+          {
+            echo "tag=$TAG"
+            echo "title=$TITLE"
+            echo "prerelease=$PRERELEASE"
+          } >> "$GITHUB_OUTPUT"
+          echo "🔖 tag=$TAG title=$TITLE prerelease=$PRERELEASE"
+
+      - name: Stage APK(s)
+        run: |
+          set -euo pipefail
+          # Only the real APK — ignore baselineProfiles/*.dm and metadata json.
+          mkdir -p input
+          find upstream -name '*.apk' -not -path '*/baselineProfiles/*' -exec cp {} input/ \;
+          ls -la input
+          test -n "$(ls -A input)" || { echo "::error::No APK in artifact"; exit 1; }
+
+      - name: Compose release notes
+        env:
+          SHORT_SHA: ${{ needs.resolve.outputs.short_sha }}
+          COMMIT_URL: ${{ needs.resolve.outputs.commit_url }}
+          COMMIT_MESSAGE: ${{ needs.resolve.outputs.commit_message }}
+          UPSTREAM_RUN_URL: ${{ needs.resolve.outputs.run_url }}
+        run: |
+          set -euo pipefail
+          {
+            echo "- Build: [Action run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"
+            echo "- Upstream: [Staging run](${UPSTREAM_RUN_URL}) · [Commit ${SHORT_SHA}](${COMMIT_URL})"
+            if [ -n "$COMMIT_MESSAGE" ]; then
+              printf '\n---\n\n## Commit message\n\n~~~\n%s\n~~~\n' "$COMMIT_MESSAGE"
+            fi
+          } > /tmp/release-notes.md
+
+      - name: Patch, sign & publish pre-release
+        uses: ./.github/actions/patch-and-release
+        with:
+          apk-dir: input
+          app-name: ${{ env.APP_NAME }}
+          tag: ${{ steps.meta.outputs.tag }}
+          title: ${{ steps.meta.outputs.title }}
+          notes-file: /tmp/release-notes.md
+          prerelease: ${{ steps.meta.outputs.prerelease }}
+          keystore-base64: ${{ secrets.KEYSTORE_BASE64 }}
+          keystore-password: ${{ secrets.KEYSTORE_PASSWORD }}
+          github-token: ${{ github.token }}
