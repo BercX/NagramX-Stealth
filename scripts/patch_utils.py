@@ -184,6 +184,23 @@ def verify_smali_contains(work_dir: Path, glob: str, pattern: str, desc: str) ->
     return False
 
 
+def verify_xml_contains(
+    paths: Iterable[Path], tag: str, pattern: str, desc: str
+) -> bool:
+    """Confirm the wanted text is present inside a matching XML tag.
+
+    A guard for edits that target a tag which is always there: such an edit
+    can't tell a real change from a no-op when a newer upstream release renames
+    the value it meant to replace, so the build can stop right here instead of
+    publishing a half-patched APK.
+    """
+    if any(re.search(pattern, e.text) for e in find_element(list(paths), tag)):
+        log_ok(f"{desc} - present")
+        return True
+    log_warn(f"{desc} - missing (upstream may have renamed it)")
+    return False
+
+
 def apply_patches(
     matches: list[Match], transform: Callable[[str], str], desc: str
 ) -> bool:

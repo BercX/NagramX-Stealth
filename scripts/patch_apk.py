@@ -12,6 +12,7 @@ from patch_utils import (
     patch_xml_string,
     smali_escape,
     verify_smali_contains,
+    verify_xml_contains,
     xml_escape_text,
 )
 
@@ -64,6 +65,12 @@ def patch_icons(work_dir: Path) -> bool:
             r"@mipmap/ic_launcher_nagram_blue(_round)?",
             r"@mipmap/ic_launcher_dr\1",
             "Application icons",
+        ),
+        verify_xml_contains(
+            [manifest_path],
+            "application",
+            r"@mipmap/ic_launcher_dr",
+            "Application icon",
         ),
         patch_activity_alias_enabled(manifest_path, "BlueIcon", False),
         patch_activity_alias_enabled(manifest_path, "TelegramIcon", True),
