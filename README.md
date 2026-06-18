@@ -55,7 +55,7 @@ The built-in updater queries the upstream NagramX repository, so its update prom
 - **Fully automated builds** - every APK is built by GitHub Actions on GitHub-hosted runners. The full pipeline is defined in [`build.yml`](.github/workflows/build.yml) and [`patch_apk.py`](scripts/patch_apk.py) - anyone can audit it.
 - **SHA-256 checksums** - each run publishes the APK checksum in the job summary, so you can verify the downloaded file matches.
 - **Auditable patches** - each run publishes a full diff of the decompiled APK (before vs after patching) as a build artifact, so you can see exactly which bytes were touched.
-- **Immutable releases** - published releases cannot be altered or replaced. Each release links to the action run that built it, and vice versa.
+- **[Immutable releases](https://docs.github.com/en/code-security/concepts/supply-chain-security/immutable-releases)** - published releases cannot be altered or replaced. Each release links to the action run that built it, and vice versa.
 - **Build attestations** - each release includes [Sigstore](https://www.sigstore.dev/) provenance attestations. You can verify any APK using [GitHub CLI](https://cli.github.com/):
   ```shell
   gh attestation verify <file>.apk --repo BercX/NagramX-Stealth
