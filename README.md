@@ -1,7 +1,6 @@
 [![Stable](https://img.shields.io/github/v/release/BercX/NagramX-Stealth?label=stable&display_name=release)](../../releases/latest)
-[![Stable date](https://img.shields.io/github/release-date/BercX/NagramX-Stealth?label=stable%20date)](../../releases/latest)
 [![Beta](https://img.shields.io/github/v/release/BercX/NagramX-Stealth?include_prereleases&display_name=release&label=beta)](../../releases)
-[![Beta date](https://img.shields.io/github/release-date-pre/BercX/NagramX-Stealth?label=beta%20date)](../../releases)
+[![Last build](https://img.shields.io/github/release-date-pre/BercX/NagramX-Stealth?label=last%20build)](../../releases)
 
 # NagramX-Stealth
 
