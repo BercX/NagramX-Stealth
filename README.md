@@ -51,6 +51,8 @@ The built-in updater queries the upstream NagramX repository, so its update prom
 - **App name and strings** - app name, menu items and other strings containing "Nagram" renamed to look like stock Telegram
 - **Icons** - launcher and notification icons replaced with stock Telegram
 
+<video src="https://github.com/user-attachments/assets/8e211999-3609-4c1c-8425-4269e96f4006" controls preload="none" width="240"></video>
+
 ## Security
 
 - **Fully automated builds** - every APK is built by GitHub Actions on GitHub-hosted runners. The full pipeline is defined in [`build.yml`](.github/workflows/build.yml) and [`patch_apk.py`](scripts/patch_apk.py) - anyone can audit it.
